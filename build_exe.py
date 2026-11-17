@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
+from ppv import __version__
 from ppv.singbox_downloader import download_singbox_binary
 from ppv.theme import create_app_pixmap
 
@@ -31,6 +34,16 @@ def main(argv: list[str] | None = None) -> int:
         "--distpath",
         default=str(ROOT / "dist"),
         help="Destination dist root folder (default: ./dist)",
+    )
+    parser.add_argument(
+        "--clean-release",
+        action="store_true",
+        help="Omit local private warpplus.conf; include warpplus.conf.example and README.md instead",
+    )
+    parser.add_argument(
+        "--zip",
+        action="store_true",
+        help="Create a distributable PPV-VPN-v<version>-win64.zip archive next to dist_dir",
     )
     args = parser.parse_args(argv)
     dist_root = Path(args.distpath).resolve()
@@ -93,11 +106,32 @@ def main(argv: list[str] | None = None) -> int:
         return res.returncode
 
     dist_dir = dist_root / "PPV-VPN"
-    warp_sample = ROOT / "warpplus.conf"
-    if warp_sample.exists():
-        shutil.copy2(warp_sample, dist_dir / "warpplus.conf")
+    if args.clean_release:
+        example_conf = ROOT / "warpplus.conf.example"
+        if example_conf.exists():
+            shutil.copy2(example_conf, dist_dir / "warpplus.conf.example")
+        readme = ROOT / "README.md"
+        if readme.exists():
+            shutil.copy2(readme, dist_dir / "README.md")
+    else:
+        warp_sample = ROOT / "warpplus.conf"
+        if warp_sample.exists():
+            shutil.copy2(warp_sample, dist_dir / "warpplus.conf")
 
     print(f"Build complete: {dist_dir / 'PPV-VPN.exe'}")
+
+    if args.zip:
+        zip_path = dist_root / f"PPV-VPN-v{__version__}-win64.zip"
+        if zip_path.exists():
+            zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(dist_dir.rglob("*")):
+                if item.is_file():
+                    zf.write(item, item.relative_to(dist_root).as_posix())
+        sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+        print(f"Archive ready: {zip_path} ({zip_path.stat().st_size} bytes)")
+        print(f"SHA256: {sha256}")
+
     return 0
 
 
