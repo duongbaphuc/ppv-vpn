@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,7 +26,9 @@ from ppv.theme import format_bytes
 
 
 class MonitorPage(QWidget):
-    """Displays real-time per-app connections (VPN vs Direct) and sing-box logs."""
+    """Displays real-time per-app connections (VPN vs Direct vs Blocked) and sing-box logs."""
+
+    logs_cleared = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -58,6 +60,7 @@ class MonitorPage(QWidget):
         self.outbound_filter.addItem("Tất cả luồng", "all")
         self.outbound_filter.addItem("Chỉ qua VPN (wg-out)", "vpn")
         self.outbound_filter.addItem("Chỉ trực tiếp (direct)", "direct")
+        self.outbound_filter.addItem("Chỉ bị chặn (reject)", "reject")
         self.outbound_filter.currentIndexChanged.connect(self._render_connections)
         filter_row.addWidget(sec1, 1)
         filter_row.addWidget(self.filter_edit)
@@ -129,10 +132,14 @@ class MonitorPage(QWidget):
 
         filtered: list[ConnectionRow] = []
         for r in self._latest_rows:
-            is_vpn = "wg-out" in r.rule_outbound.lower()
+            out_low = r.rule_outbound.lower()
+            is_vpn = "wg-out" in out_low
+            is_reject = "reject" in out_low or "block" in out_low
             if mode == "vpn" and not is_vpn:
                 continue
-            if mode == "direct" and is_vpn:
+            if mode == "direct" and (is_vpn or is_reject):
+                continue
+            if mode == "reject" and not is_reject:
                 continue
             if query and query not in r.process_name.lower() and query not in r.destination.lower():
                 continue
@@ -140,20 +147,34 @@ class MonitorPage(QWidget):
 
         self.table.setRowCount(len(filtered))
         for idx, r in enumerate(filtered):
-            is_vpn = "wg-out" in r.rule_outbound.lower()
+            out_low = r.rule_outbound.lower()
+            is_vpn = "wg-out" in out_low
+            is_reject = "reject" in out_low or "block" in out_low
             self.table.setItem(idx, 0, QTableWidgetItem(r.process_name))
             self.table.setItem(idx, 1, QTableWidgetItem(r.destination))
             self.table.setItem(idx, 2, QTableWidgetItem(r.network))
 
-            out_item = QTableWidgetItem("VPN (wg-out)" if is_vpn else "Trực tiếp (direct)")
-            out_item.setForeground(QColor("#34d399") if is_vpn else QColor("#94a3b8"))
-            self.table.setItem(idx, 3, out_item)
-
-            self.table.setItem(idx, 4, QTableWidgetItem(format_bytes(r.upload_bytes)))
-            self.table.setItem(idx, 5, QTableWidgetItem(format_bytes(r.download_bytes)))
+            if is_reject:
+                out_item = QTableWidgetItem("Bị chặn (Block)")
+                out_item.setForeground(QColor("#fb7185"))
+                self.table.setItem(idx, 3, out_item)
+                count_txt = f"Chặn ({r.blocked_count or 1}x)"
+                self.table.setItem(idx, 4, QTableWidgetItem(count_txt))
+                self.table.setItem(idx, 5, QTableWidgetItem(r.timestamp or "—"))
+            else:
+                if is_vpn:
+                    out_item = QTableWidgetItem("VPN (wg-out)")
+                    out_item.setForeground(QColor("#34d399"))
+                else:
+                    out_item = QTableWidgetItem("Trực tiếp (direct)")
+                    out_item.setForeground(QColor("#94a3b8"))
+                self.table.setItem(idx, 3, out_item)
+                self.table.setItem(idx, 4, QTableWidgetItem(format_bytes(r.upload_bytes)))
+                self.table.setItem(idx, 5, QTableWidgetItem(format_bytes(r.download_bytes)))
 
     def _copy_logs(self) -> None:
         QApplication.clipboard().setText(self.log_box.toPlainText())
 
     def _clear_logs(self) -> None:
         self.log_box.clear()
+        self.logs_cleared.emit()

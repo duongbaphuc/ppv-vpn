@@ -10,6 +10,8 @@ from typing import Any, Literal
 SplitMode = Literal["include", "exclude"]
 DnsMode = Literal["split", "vpn_all", "local"]
 MatchType = Literal["name", "path"]
+RuleAction = Literal["vpn", "allow", "block"]
+FirewallMode = Literal["blacklist", "allowlist"]
 
 
 def utc_now_iso() -> str:
@@ -72,13 +74,15 @@ class WireGuardProfile:
 
 @dataclass
 class AppRule:
-    """Represents an application rule for per-app VPN split tunneling."""
+    """Represents an application rule for per-app VPN split tunneling and Simple Firewall."""
 
     display_name: str
     exe_name: str
     exe_path: str
     enabled: bool = True
     match_type: MatchType = "name"
+    action: RuleAction = "vpn"
+    added_at: str = field(default_factory=utc_now_iso)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,6 +93,9 @@ class AppRule:
         match_type = data.get("match_type", "name")
         if match_type not in ("name", "path"):
             match_type = "name"
+        action = data.get("action", "vpn")
+        if action not in ("vpn", "allow", "block"):
+            action = "vpn"
         return cls(
             id=str(data.get("id") or uuid.uuid4().hex[:12]),
             display_name=str(data.get("display_name") or data["exe_name"]),
@@ -96,6 +103,8 @@ class AppRule:
             exe_path=str(data.get("exe_path") or data["exe_name"]),
             enabled=bool(data.get("enabled", True)),
             match_type=match_type,
+            action=action,
+            added_at=str(data.get("added_at") or ""),
         )
 
 
@@ -114,7 +123,18 @@ class AppSettings:
     start_minimized: bool = False
     auto_connect_on_start: bool = False
     auto_stop_other_vpns: bool = True
+    firewall_enabled: bool = False
+    firewall_mode: FirewallMode = "allowlist"
+    block_unassigned_in_vpn: bool = True
+    firewall_saved_profiles: dict[str, dict[str, int | bool]] | None = None
     app_rules: list[AppRule] = field(default_factory=list)
+
+    @property
+    def is_unassigned_blocked_in_vpn(self) -> bool:
+        """Return True when unassigned apps should be rejected inside the sing-box tunnel."""
+        return self.firewall_mode == "allowlist" and (
+            self.firewall_enabled or self.block_unassigned_in_vpn
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +149,10 @@ class AppSettings:
             "start_minimized": self.start_minimized,
             "auto_connect_on_start": self.auto_connect_on_start,
             "auto_stop_other_vpns": self.auto_stop_other_vpns,
+            "firewall_enabled": self.firewall_enabled,
+            "firewall_mode": self.firewall_mode,
+            "block_unassigned_in_vpn": self.block_unassigned_in_vpn,
+            "firewall_saved_profiles": self.firewall_saved_profiles,
             "app_rules": [r.to_dict() for r in self.app_rules],
         }
 
@@ -140,6 +164,12 @@ class AppSettings:
         dns_mode = data.get("dns_mode", "split")
         if dns_mode not in ("split", "vpn_all", "local"):
             dns_mode = "split"
+        fw_mode = data.get("firewall_mode", "allowlist")
+        if fw_mode not in ("blacklist", "allowlist"):
+            fw_mode = "allowlist"
+        saved_profiles = data.get("firewall_saved_profiles")
+        if not isinstance(saved_profiles, dict):
+            saved_profiles = None
         return cls(
             active_profile_id=data.get("active_profile_id"),
             split_mode=split_mode,
@@ -152,5 +182,9 @@ class AppSettings:
             start_minimized=bool(data.get("start_minimized", False)),
             auto_connect_on_start=bool(data.get("auto_connect_on_start", False)),
             auto_stop_other_vpns=bool(data.get("auto_stop_other_vpns", True)),
+            firewall_enabled=bool(data.get("firewall_enabled", False)),
+            firewall_mode=fw_mode,
+            block_unassigned_in_vpn=bool(data.get("block_unassigned_in_vpn", True)),
+            firewall_saved_profiles=saved_profiles,
             app_rules=[AppRule.from_dict(r) for r in data.get("app_rules", [])],
         )

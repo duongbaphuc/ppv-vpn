@@ -113,10 +113,17 @@ class SingleInstanceController(QObject):
             conn.flush()
 
     def close(self) -> None:
+        clients = list(self._clients)
         self._clients.clear()
+        for conn in clients:
+            with contextlib.suppress(Exception):
+                conn.disconnect()
+                conn.close()
+                conn.deleteLater()
         if self._server is not None:
             with contextlib.suppress(Exception):
                 self._server.close()
+                self._server.deleteLater()
             self._server = None
             with contextlib.suppress(Exception):
                 QLocalServer.removeServer(self.server_name)

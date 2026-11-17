@@ -69,3 +69,36 @@ def test_register_warp_profile_http_error(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(WarpRegistrationError):
         register_warp_profile()
+
+
+def test_register_warp_profile_falls_back_to_windows_cert_store_on_ssl_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_resp = MagicMock()
+    fake_resp.ok = True
+    fake_resp.json.return_value = {
+        "config": {
+            "client_id": "+Vbt",
+            "interface": {"addresses": {"v4": "172.16.0.2"}},
+            "peers": [
+                {
+                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                    "endpoint": {"host": "engage.cloudflareclient.com:2408"},
+                }
+            ],
+        }
+    }
+
+    def raise_ssl(*args, **kwargs):
+        raise warp_api.requests.exceptions.SSLError("certificate verify failed")
+
+    fake_session = MagicMock()
+    fake_session.post.return_value = fake_resp
+
+    monkeypatch.setattr(warp_api.requests, "post", raise_ssl)
+    monkeypatch.setattr(warp_api, "_build_windows_trust_session", lambda: fake_session)
+
+    prof = register_warp_profile(name="Corporate WARP")
+    assert prof.name == "Corporate WARP"
+    assert prof.reserved == [249, 86, 237]
+    fake_session.post.assert_called_once()

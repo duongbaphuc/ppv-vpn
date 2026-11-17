@@ -3,15 +3,51 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
 import random
+import ssl
 import string
 
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
+from requests.adapters import HTTPAdapter
 
 from ppv.models import WireGuardProfile
+
+
+class _WinCertHTTPAdapter(HTTPAdapter):
+    """HTTPAdapter verifying HTTPS against Windows Certificate Store (enterprise Root CAs)."""
+
+    def __init__(self, ssl_context: ssl.SSLContext) -> None:
+        self._ssl_context = ssl_context
+        super().__init__()
+
+    def init_poolmanager(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+
+def _build_windows_trust_session() -> requests.Session:
+    ctx = ssl.create_default_context()
+    # Many enterprise Windows Root CAs omit the critical flag on Basic Constraints,
+    # which Python 3.13 / OpenSSL 3.x VERIFY_X509_STRICT rejects by default.
+    ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    enum_certs = getattr(ssl, "enum_certificates", None)
+    if callable(enum_certs):
+        for store_name in ("ROOT", "CA"):
+            try:
+                certs = enum_certs(store_name)
+            except Exception:
+                continue
+            for cert_bytes, enc, _trust in certs:
+                if enc == "x509_asn":
+                    with contextlib.suppress(Exception):
+                        ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert_bytes))
+    session = requests.Session()
+    session.mount("https://", _WinCertHTTPAdapter(ctx))
+    return session
 
 WARP_REG_URL = "https://api.cloudflareclient.com/v0a2158/reg"
 WARP_HEADERS = {
@@ -84,7 +120,13 @@ def register_warp_profile(
     }
 
     try:
-        resp = requests.post(WARP_REG_URL, headers=WARP_HEADERS, json=payload, timeout=timeout)
+        try:
+            resp = requests.post(WARP_REG_URL, headers=WARP_HEADERS, json=payload, timeout=timeout)
+        except requests.exceptions.SSLError:
+            win_session = _build_windows_trust_session()
+            resp = win_session.post(
+                WARP_REG_URL, headers=WARP_HEADERS, json=payload, timeout=timeout
+            )
     except requests.RequestException as exc:
         raise WarpRegistrationError(f"Không thể kết nối tới máy chủ Cloudflare WARP: {exc}") from exc
 

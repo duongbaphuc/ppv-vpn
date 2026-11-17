@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ppv.core_manager import WireGuardProbeResult, probe_wireguard_profile
 from ppv.models import AppSettings, WireGuardProfile
 from ppv.process_helper import (
     find_conflicting_vpns,
@@ -25,6 +26,19 @@ from ppv.process_helper import (
     stop_conflicting_vpns,
 )
 from ppv.theme import format_bytes, format_speed
+
+
+class _TunnelProbeWorker(QThread):
+    result_ready = Signal(object, bool)  # WireGuardProbeResult, other_vpn_active
+
+    def __init__(self, profile: WireGuardProfile, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.profile = profile
+
+    def run(self) -> None:
+        other_active = bool(find_conflicting_vpns())
+        res = probe_wireguard_profile(self.profile, timeout=4.5)
+        self.result_ready.emit(res, other_active)
 
 
 class _IpCheckWorker(QThread):
@@ -73,6 +87,7 @@ class DashboardPage(QWidget):
         self.profiles = profiles
         self._state = "disconnected"
         self._ip_worker: _IpCheckWorker | None = None
+        self._probe_worker: _TunnelProbeWorker | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -111,6 +126,29 @@ class DashboardPage(QWidget):
         c_lay.addWidget(self.stop_conflict_btn)
         self.conflict_banner.setVisible(False)
         root.addWidget(self.conflict_banner)
+
+        # WireGuard handshake health warning banner
+        self.tunnel_warn_banner = QFrame()
+        self.tunnel_warn_banner.setObjectName("WarningBanner")
+        self.tunnel_warn_banner.setStyleSheet(
+            "QFrame#WarningBanner { background-color: #450a0a; border: 1px solid #ef4444; border-radius: 10px; }"
+        )
+        tw_lay = QHBoxLayout(self.tunnel_warn_banner)
+        tw_lay.setContentsMargins(14, 10, 14, 10)
+        self.tunnel_warn_label = QLabel()
+        self.tunnel_warn_label.setWordWrap(True)
+        self.tunnel_warn_label.setStyleSheet("color: #fecaca; font-weight: 600;")
+        self.tunnel_check_prof_btn = QPushButton("Kiểm tra Profile")
+        self.tunnel_check_prof_btn.setObjectName("PrimaryButton")
+        self.tunnel_check_prof_btn.clicked.connect(self.open_profiles_requested.emit)
+        self.tunnel_stop_btn = QPushButton("Ngắt kết nối")
+        self.tunnel_stop_btn.setObjectName("DangerButton")
+        self.tunnel_stop_btn.clicked.connect(self.toggle_connect_requested.emit)
+        tw_lay.addWidget(self.tunnel_warn_label, 1)
+        tw_lay.addWidget(self.tunnel_check_prof_btn)
+        tw_lay.addWidget(self.tunnel_stop_btn)
+        self.tunnel_warn_banner.setVisible(False)
+        root.addWidget(self.tunnel_warn_banner)
 
         # Admin status banner
         self.admin_banner = QFrame()
@@ -235,9 +273,12 @@ class DashboardPage(QWidget):
         self.ip_label = QLabel("Mẹo kiểm tra: thêm trình duyệt vào tab Ứng dụng rồi mở ipinfo.io để xem IP VPN; mở tab Giám sát để xem từng kết nối.")
         self.ip_label.setWordWrap(True)
         self.ip_label.setObjectName("MutedText")
+        self.check_tunnel_btn = QPushButton("Kiểm tra Tunnel WARP")
+        self.check_tunnel_btn.clicked.connect(self._probe_active_tunnel)
         self.check_ip_btn = QPushButton("Kiểm tra IP mạng gốc")
         self.check_ip_btn.clicked.connect(self._check_direct_ip)
         ip_lay.addWidget(self.ip_label, 1)
+        ip_lay.addWidget(self.check_tunnel_btn)
         ip_lay.addWidget(self.check_ip_btn)
         root.addWidget(ip_card)
 
@@ -309,18 +350,23 @@ class DashboardPage(QWidget):
         self.radio_exclude.blockSignals(False)
 
         enabled_apps = [r for r in self.settings.app_rules if r.enabled]
+        vpn_count = sum(1 for r in enabled_apps if r.action == "vpn")
+        allow_count = sum(1 for r in enabled_apps if r.action == "allow")
+        block_count = sum(1 for r in enabled_apps if r.action == "block")
+        fw_status = (
+            f"Firewall: Đang bật ({'Allowlist' if self.settings.firewall_mode == 'allowlist' else 'Blacklist'})"
+            if self.settings.firewall_enabled
+            else "Firewall: Đang tắt"
+        )
         if enabled_apps:
-            preview = ", ".join(r.exe_name for r in enabled_apps[:6])
-            if len(enabled_apps) > 6:
-                preview += f" (+{len(enabled_apps) - 6} app nữa)"
             self.apps_summary_label.setText(
-                f"Đang bật {len(enabled_apps)} ứng dụng: {preview}"
+                f"Quy tắc đang bật: Qua VPN ({vpn_count}) • Cho phép mạng ({allow_count}) • Chặn ({block_count})  |  {fw_status}"
             )
         else:
             self.apps_summary_label.setText(
-                "Chưa bật ứng dụng nào trong danh sách."
+                f"Chưa bật quy tắc ứng dụng nào.  |  {fw_status}"
             )
-        self.apps_count_btn.setText(f"Quản lý ứng dụng ({len(enabled_apps)})")
+        self.apps_count_btn.setText(f"Tường lửa && Ứng dụng ({len(enabled_apps)})")
 
     def set_connection_state(self, state: str) -> None:
         self._state = state
@@ -385,9 +431,16 @@ class DashboardPage(QWidget):
         self.down_value.setText(format_speed(down_bps))
         self.down_total_lbl.setText(f"Tổng: {format_bytes(down_total)}")
         vpn_count = sum(1 for c in conns if "wg-out" in c.rule_outbound.lower())
-        direct_count = max(0, len(conns) - vpn_count)
+        blocked_count = sum(
+            1
+            for c in conns
+            if "reject" in c.rule_outbound.lower() or "block" in c.rule_outbound.lower()
+        )
+        direct_count = max(0, len(conns) - vpn_count - blocked_count)
         self.conn_value.setText(str(len(conns)))
-        self.conn_sub_lbl.setText(f"Qua VPN: {vpn_count} | Trực tiếp: {direct_count}")
+        self.conn_sub_lbl.setText(
+            f"VPN: {vpn_count} | Mở: {direct_count} | Chặn: {blocked_count}"
+        )
 
     def _on_profile_changed(self) -> None:
         prof_id = self.profile_combo.currentData()
@@ -411,3 +464,50 @@ class DashboardPage(QWidget):
         self.check_ip_btn.setEnabled(True)
         self.check_ip_btn.setText("Kiểm tra IP mạng gốc")
         self.ip_label.setText(f"IP trực tiếp của máy: {result}")
+
+    def set_tunnel_warning(self, message: str) -> None:
+        text = message.strip()
+        self.tunnel_warn_label.setText(text)
+        self.tunnel_warn_banner.setVisible(bool(text))
+
+    def _probe_active_tunnel(self) -> None:
+        active = next(
+            (p for p in self.profiles if p.id == self.settings.active_profile_id),
+            None,
+        )
+        if active is None:
+            QMessageBox.information(
+                self,
+                "Chưa chọn Profile",
+                "Hãy tạo hoặc chọn một Profile WireGuard trước khi kiểm tra.",
+            )
+            return
+        self.check_tunnel_btn.setEnabled(False)
+        self.check_tunnel_btn.setText("Đang kiểm tra WARP...")
+        self.ip_label.setText(
+            f"Đang kiểm tra bắt tay WireGuard tới {active.endpoint} (tối đa 5 giây)..."
+        )
+        self._probe_worker = _TunnelProbeWorker(active, self)
+        self._probe_worker.result_ready.connect(self._on_tunnel_probed)
+        self._probe_worker.start()
+
+    def _on_tunnel_probed(self, res: WireGuardProbeResult, other_vpn_active: bool) -> None:
+        self.check_tunnel_btn.setEnabled(True)
+        self.check_tunnel_btn.setText("Kiểm tra Tunnel WARP")
+        note = " (Lưu ý: VPN hệ thống khác đang bật nên test đi qua VPN đó)" if other_vpn_active else ""
+        if res.ok:
+            warp_info = f"warp={res.warp_status}" if res.warp_status else "OK"
+            loc_info = f" ({res.loc})" if res.loc else ""
+            self.ip_label.setText(
+                f"Tunnel WARP hoạt động: {res.endpoint_host}:{res.endpoint_port} -> "
+                f"IP {res.exit_ip or '?'}{loc_info}, {warp_info}, {res.latency_ms} ms.{note}"
+            )
+        else:
+            self.ip_label.setText(
+                f"Tunnel WARP LỖI ({res.endpoint_host}:{res.endpoint_port}): {res.error}{note}"
+            )
+
+    def stop_workers(self) -> None:
+        for w in (self._ip_worker, self._probe_worker):
+            if w is not None and w.isRunning():
+                w.wait(1500)

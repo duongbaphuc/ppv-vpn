@@ -3,10 +3,14 @@
 Ứng dụng desktop trên Windows giúp dùng **WireGuard / Cloudflare WARP+** theo **từng ứng dụng cụ thể** (Per-App Split Tunneling) thay vì đẩy toàn bộ lưu lượng máy qua VPN như APKCombo VPN.
 
 ## Tính năng chính
-- **Chia tách theo từng ứng dụng (Per-App Routing)**:
-  - **Include (Khuyên dùng)**: Chỉ những `.exe` bạn bật mới đi qua VPN; các ứng dụng còn lại và hệ thống giữ nguyên mạng gốc.
-  - **Exclude**: Toàn bộ máy đi qua VPN ngoại trừ các app được loại trừ.
-  - Hỗ trợ khớp theo **tên file `.exe`** (bền vững khi app cập nhật phiên bản như Chrome, Discord, Telegram) hoặc **đường dẫn chính xác**.
+- **Simple Firewall & Chia tách ứng dụng (Per-App Firewall + Split Tunneling)**:
+  - Hiển thị trực tiếp danh sách các tiến trình đang chạy và ứng dụng đã lưu quy tắc dạng bảng giống **simplewall** (hỗ trợ tìm kiếm `Ctrl+F`, lọc theo trạng thái, chuột phải mở menu nhanh, tô màu theo hành động).
+  - Gán quyền mạng trực tiếp cho từng ứng dụng / tiến trình:
+    - **Qua VPN (`wg-out`)** *(xanh dương)*: đi qua đường hầm WireGuard / WARP+.
+    - **Cho phép mạng (`Allow`)** *(xanh lá)*: cho phép kết nối trực tiếp, không qua VPN.
+    - **Chặn mạng (`Block`)** *(đỏ)*: chặn hoàn toàn kết nối mạng bằng **Windows Firewall (WFP)** (kể cả khi tắt VPN) kết hợp `reject` trong `sing-box`.
+  - Hỗ trợ **2 chế độ Firewall**: mặc định **Allowlist chặt (giống simplewall)** (chặn app chưa gán trong tunnel VPN và/hoặc ở tầng Windows Firewall, chỉ mở các app đã chọn + tự giữ DNS/DHCP & `sing-box.exe`) và **Blacklist (An toàn)** (mặc định mở, chỉ chặn app chọn Block); tự khôi phục cấu hình gốc khi tắt Firewall.
+  - Chế độ **Include** / **Exclude** và khớp theo **tên `.exe`** hoặc **đường dẫn chính xác**.
 - **Quản lý Profile WireGuard & WARP+**:
   - Tự động nhận diện `warpplus.conf` có sẵn trong thư mục ứng dụng (xem mẫu [warpplus.conf.example](warpplus.conf.example)).
   - Hỗ trợ nhập nhiều file `.conf` hoặc dán cấu hình WireGuard.

@@ -108,3 +108,36 @@ def test_tray_icon_colors_by_state() -> None:
     err_img = create_app_pixmap(state="error", size=64).toImage()
     err_px = err_img.pixelColor(22, 40)
     assert err_px.red() > err_px.green() and err_px.red() > err_px.blue()
+
+
+def test_profiles_page_buttons_not_clipped_at_default_width() -> None:
+    from ppv.ui.profiles_page import ProfilesPage
+
+    app = _ensure_app()
+    prof = WireGuardProfile(
+        id="p1",
+        name="WARP+ (warpplus.conf)",
+        private_key="A" * 43 + "=",
+        addresses=["172.16.0.2/32"],
+        public_key="B" * 43 + "=",
+        endpoint_host="engage.cloudflareclient.com",
+        endpoint_port=2408,
+    )
+    page = ProfilesPage(settings=AppSettings(active_profile_id="p1"), profiles=[prof])
+    # Simulate width of right stacked page inside 980px MainWindow (minus 210px sidebar)
+    page.resize(770, 620)
+    page.show()
+    app.processEvents()
+
+    for btn in (
+        page.gen_warp_btn,
+        page.set_active_btn,
+        page.probe_btn,
+        page.reveal_btn,
+        page.export_btn,
+        page.delete_btn,
+    ):
+        assert btn.width() >= btn.sizeHint().width(), (
+            f"Button {btn.text()!r} clipped: {btn.width()} < {btn.sizeHint().width()}"
+        )
+    page.close()

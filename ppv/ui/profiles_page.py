@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -22,9 +23,46 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ppv.core_manager import (
+    WireGuardProbeResult,
+    find_working_warp_endpoint,
+    probe_wireguard_profile,
+)
 from ppv.models import AppSettings, WireGuardProfile
+from ppv.process_helper import find_conflicting_vpns
 from ppv.warp_api import WarpRegistrationError, register_warp_profile
 from ppv.wg_parser import WireGuardParseError, parse_wireguard_conf, profile_to_conf
+
+
+class _ProfileProbeWorker(QThread):
+    progress = Signal(int, int, str, int)
+    finished_probe = Signal(str, object, bool, bool)  # prof_id, result, scan_mode, other_vpn_active
+
+    def __init__(
+        self,
+        profile: WireGuardProfile,
+        scan_alternatives: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.profile = profile
+        self.scan_alternatives = scan_alternatives
+        self.cancel_event = threading.Event()
+
+    def run(self) -> None:
+        other_active = bool(find_conflicting_vpns())
+        if self.scan_alternatives:
+            res = find_working_warp_endpoint(
+                self.profile,
+                timeout_per_try=3.5,
+                cancel_event=self.cancel_event,
+                progress_cb=lambda idx, total, host, port: self.progress.emit(
+                    idx, total, host, port
+                ),
+            )
+        else:
+            res = probe_wireguard_profile(self.profile, timeout=4.5)
+        self.finished_probe.emit(self.profile.id, res, self.scan_alternatives, other_active)
 
 
 class _WarpRegWorker(QThread):
@@ -87,6 +125,8 @@ class ProfilesPage(QWidget):
         self.settings = settings
         self.profiles = profiles
         self._warp_worker: _WarpRegWorker | None = None
+        self._probe_worker: _ProfileProbeWorker | None = None
+        self._auto_activate_next_warp = False
         self._reveal_private = False
 
         root = QVBoxLayout(self)
@@ -142,11 +182,22 @@ class ProfilesPage(QWidget):
         self.detail_text.setStyleSheet('font-family: "Consolas", "Courier New", monospace; font-size: 12px;')
         d_lay.addWidget(self.detail_text, 1)
 
-        action_row = QHBoxLayout()
+        action_row_top = QHBoxLayout()
+        action_row_top.setSpacing(8)
         self.set_active_btn = QPushButton("Đặt làm mặc định")
         self.set_active_btn.setObjectName("PrimaryButton")
         self.set_active_btn.clicked.connect(self._set_selected_active)
 
+        self.probe_btn = QPushButton("Kiểm tra / Tìm Endpoint")
+        self.probe_btn.clicked.connect(self._probe_selected)
+
+        action_row_top.addWidget(self.set_active_btn)
+        action_row_top.addWidget(self.probe_btn)
+        action_row_top.addStretch()
+        d_lay.addLayout(action_row_top)
+
+        action_row_bottom = QHBoxLayout()
+        action_row_bottom.setSpacing(8)
         self.reveal_btn = QPushButton("Hiện PrivateKey")
         self.reveal_btn.clicked.connect(self._toggle_reveal)
 
@@ -157,12 +208,11 @@ class ProfilesPage(QWidget):
         self.delete_btn.setObjectName("DangerButton")
         self.delete_btn.clicked.connect(self._delete_selected)
 
-        action_row.addWidget(self.set_active_btn)
-        action_row.addWidget(self.reveal_btn)
-        action_row.addWidget(self.export_btn)
-        action_row.addStretch()
-        action_row.addWidget(self.delete_btn)
-        d_lay.addLayout(action_row)
+        action_row_bottom.addWidget(self.reveal_btn)
+        action_row_bottom.addWidget(self.export_btn)
+        action_row_bottom.addStretch()
+        action_row_bottom.addWidget(self.delete_btn)
+        d_lay.addLayout(action_row_bottom)
 
         split.addWidget(detail_card, 2)
         root.addLayout(split, 1)
@@ -206,6 +256,8 @@ class ProfilesPage(QWidget):
     def _render_details(self, prof: WireGuardProfile | None) -> None:
         has_prof = prof is not None
         self.set_active_btn.setEnabled(has_prof)
+        if self._probe_worker is None or not self._probe_worker.isRunning():
+            self.probe_btn.setEnabled(has_prof)
         self.reveal_btn.setEnabled(has_prof)
         self.export_btn.setEnabled(has_prof)
         self.delete_btn.setEnabled(has_prof)
@@ -230,15 +282,23 @@ class ProfilesPage(QWidget):
         self._render_details(self._selected_profile())
 
     def _create_warp_profile(self) -> None:
+        self._start_warp_registration(auto_activate=False, prompt_name=True)
+
+    def _start_warp_registration(self, auto_activate: bool = False, prompt_name: bool = True) -> None:
         default_name = f"Cloudflare WARP #{len(self.profiles) + 1}"
-        name, ok = QInputDialog.getText(
-            self, "Tạo Cloudflare WARP miễn phí", "Tên profile:", text=default_name
-        )
-        if not ok:
-            return
+        if prompt_name:
+            name, ok = QInputDialog.getText(
+                self, "Tạo Cloudflare WARP miễn phí", "Tên profile:", text=default_name
+            )
+            if not ok:
+                return
+            chosen = name.strip() or default_name
+        else:
+            chosen = default_name
+        self._auto_activate_next_warp = auto_activate
         self.gen_warp_btn.setEnabled(False)
         self.gen_warp_btn.setText("Đang đăng ký WARP...")
-        self._warp_worker = _WarpRegWorker(name.strip() or default_name, self)
+        self._warp_worker = _WarpRegWorker(chosen, self)
         self._warp_worker.succeeded.connect(self._on_warp_created)
         self._warp_worker.failed.connect(self._on_warp_failed)
         self._warp_worker.start()
@@ -247,17 +307,20 @@ class ProfilesPage(QWidget):
         self.gen_warp_btn.setEnabled(True)
         self.gen_warp_btn.setText("+ Tạo Cloudflare WARP miễn phí")
         self.profiles.append(prof)
-        if not self.settings.active_profile_id:
+        if self._auto_activate_next_warp or not self.settings.active_profile_id:
             self.settings.active_profile_id = prof.id
+        self._auto_activate_next_warp = False
         self.profiles_changed.emit()
         self.refresh_list()
         QMessageBox.information(
             self,
             "Thành công",
-            f"Đã tạo profile '{prof.name}' với Endpoint {prof.endpoint}!",
+            f"Đã tạo profile '{prof.name}' với Endpoint {prof.endpoint}!\n"
+            "Bạn có thể bấm 'Kiểm tra / Tìm Endpoint' hoặc 'KẾT NỐI' ngay.",
         )
 
     def _on_warp_failed(self, err: str) -> None:
+        self._auto_activate_next_warp = False
         self.gen_warp_btn.setEnabled(True)
         self.gen_warp_btn.setText("+ Tạo Cloudflare WARP miễn phí")
         QMessageBox.warning(self, "Không thể tạo WARP", err)
@@ -314,6 +377,130 @@ class ProfilesPage(QWidget):
         prof = self._selected_profile()
         if prof:
             self.active_profile_changed.emit(prof.id)
+
+    def _probe_selected(self) -> None:
+        prof = self._selected_profile()
+        if prof is None:
+            return
+        if self._probe_worker is not None and self._probe_worker.isRunning():
+            return
+        self._start_profile_probe(prof, scan_alternatives=False)
+
+    def _start_profile_probe(self, prof: WireGuardProfile, scan_alternatives: bool) -> None:
+        self.probe_btn.setEnabled(False)
+        self.probe_btn.setText(
+            "Đang dò Endpoint WARP..." if scan_alternatives else "Đang kiểm tra..."
+        )
+        self._probe_worker = _ProfileProbeWorker(
+            prof, scan_alternatives=scan_alternatives, parent=self
+        )
+        self._probe_worker.progress.connect(self._on_probe_progress)
+        self._probe_worker.finished_probe.connect(self._on_probe_finished)
+        self._probe_worker.start()
+
+    def _on_probe_progress(self, idx: int, total: int, host: str, port: int) -> None:
+        self.probe_btn.setText(f"Đang dò ({idx}/{total})...")
+
+    def _on_probe_finished(
+        self,
+        prof_id: str,
+        res: WireGuardProbeResult,
+        scan_mode: bool,
+        other_vpn_active: bool,
+    ) -> None:
+        prof = next((p for p in self.profiles if p.id == prof_id), None)
+        self.probe_btn.setEnabled(self._selected_profile() is not None)
+        self.probe_btn.setText("Kiểm tra / Tìm Endpoint")
+        if prof is None:
+            return
+
+        note = (
+            "\n\nLưu ý: VPN hệ thống khác đang bật, nên kiểm tra đang đi qua VPN đó. "
+            "Hãy tắt VPN khác để kiểm tra mạng vật lý trực tiếp."
+            if other_vpn_active
+            else ""
+        )
+        if res.ok:
+            changed = (
+                res.endpoint_host != prof.endpoint_host
+                or int(res.endpoint_port) != int(prof.endpoint_port)
+            )
+            detail_msg = (
+                f"Tunnel WireGuard hoạt động!\n"
+                f"Endpoint: {res.endpoint_host}:{res.endpoint_port}\n"
+                f"IP thoát: {res.exit_ip or '?'} ({res.loc or '?'})\n"
+                f"Trạng thái WARP: {res.warp_status or 'ok'}\n"
+                f"Độ trễ: {res.latency_ms} ms{note}"
+            )
+            if scan_mode and changed:
+                reply = QMessageBox.question(
+                    self,
+                    "Tìm thấy Endpoint WARP hoạt động",
+                    f"{detail_msg}\n\nÁp dụng Endpoint {res.endpoint_host}:{res.endpoint_port} "
+                    f"cho profile '{prof.name}' ngay?",
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    prof.endpoint_host = res.endpoint_host
+                    prof.endpoint_port = int(res.endpoint_port)
+                    self.profiles_changed.emit()
+                    self.refresh_list()
+            else:
+                QMessageBox.information(self, f"Kiểm tra {prof.name}", detail_msg)
+            return
+
+        if not scan_mode:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(f"Endpoint {prof.name} không phản hồi")
+            extra_hint = (
+                "\n• Nếu đang dùng file .conf cũ (như warpplus.conf), key WireGuard có thể đã hết hạn trên Cloudflare — "
+                "bấm 'Tạo WARP mới' để lấy key hoạt động ngay."
+                if prof.source != "warp"
+                else ""
+            )
+            box.setText(
+                f"Kiểm tra tới {res.endpoint_host}:{res.endpoint_port} thất bại:\n"
+                f"{res.error}{note}{extra_hint}\n\n"
+                "Chọn cách xử lý:"
+            )
+            new_warp_btn = box.addButton(
+                "Tạo Cloudflare WARP mới (Khuyên dùng)", QMessageBox.ButtonRole.AcceptRole
+            )
+            scan_btn = box.addButton(
+                "Dò Endpoint/Port khác", QMessageBox.ButtonRole.ActionRole
+            )
+            box.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() == new_warp_btn:
+                self._start_warp_registration(auto_activate=True, prompt_name=False)
+            elif box.clickedButton() == scan_btn:
+                self._start_profile_probe(prof, scan_alternatives=True)
+            return
+
+        box2 = QMessageBox(self)
+        box2.setIcon(QMessageBox.Icon.Warning)
+        box2.setWindowTitle("Không tìm thấy Endpoint phản hồi")
+        box2.setText(
+            f"Đã thử các Endpoint/Port Cloudflare WARP cho '{prof.name}' nhưng không nhận được phản hồi bắt tay.\n\n"
+            f"Chi tiết cuối: {res.error}{note}\n\n"
+            "Nguyên nhân thường gặp:\n"
+            "• Key WireGuard của file .conf đã hết hạn hoặc bị Cloudflare thu hồi.\n"
+            "• Hoặc firewall ngoài (simplewall / mạng công ty) đang chặn sing-box.exe gửi UDP."
+        )
+        new_warp_btn2 = box2.addButton(
+            "Tạo Cloudflare WARP mới ngay", QMessageBox.ButtonRole.AcceptRole
+        )
+        box2.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+        box2.exec()
+        if box2.clickedButton() == new_warp_btn2:
+            self._start_warp_registration(auto_activate=True, prompt_name=False)
+
+    def stop_workers(self) -> None:
+        if self._probe_worker is not None and self._probe_worker.isRunning():
+            self._probe_worker.cancel_event.set()
+            self._probe_worker.wait(2000)
+        if self._warp_worker is not None and self._warp_worker.isRunning():
+            self._warp_worker.wait(1500)
 
     def _export_selected(self) -> None:
         prof = self._selected_profile()

@@ -32,6 +32,15 @@ QTableWidget QWidget {
     background-color: transparent;
 }
 
+QTableWidget QComboBox {
+    padding: 3px 6px;
+    font-size: 12px;
+}
+
+QTableWidget QComboBox::drop-down {
+    width: 18px;
+}
+
 QMessageBox {
     background-color: #0f172a;
 }

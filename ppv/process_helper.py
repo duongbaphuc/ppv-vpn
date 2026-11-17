@@ -459,7 +459,25 @@ def _get_exe_friendly_name(exe_path: str) -> str:
     return stem
 
 
-def list_running_apps(include_background: bool = True) -> list[DiscoveredApp]:
+_SYS32_NETWORK_TOOLS = {
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "curl.exe",
+    "ssh.exe",
+    "scp.exe",
+    "sftp.exe",
+    "winget.exe",
+    "cscript.exe",
+    "wscript.exe",
+    "msiexec.exe",
+}
+
+
+def list_running_apps(
+    include_background: bool = True,
+    include_system_binaries: bool = False,
+) -> list[DiscoveredApp]:
     """List currently running Windows applications deduplicated by executable path."""
     window_pids = _get_visible_window_pids()
     by_path: dict[str, DiscoveredApp] = {}
@@ -475,9 +493,9 @@ def list_running_apps(include_background: bool = True) -> list[DiscoveredApp]:
         if not full_path or not full_path.lower().endswith(".exe") or not os.path.exists(full_path):
             continue
         norm_key = full_path.lower()
-        # Skip noisy Windows internal binaries unless they own a visible window
+        # Skip noisy Windows internal binaries unless requested, visible window, or CLI tool
         is_sys32 = "\\windows\\system32\\" in norm_key or "\\windows\\syswow64\\" in norm_key
-        if is_sys32 and not has_win:
+        if is_sys32 and not include_system_binaries and not has_win and low_name not in _SYS32_NETWORK_TOOLS:
             continue
         existing = by_path.get(norm_key)
         if existing is None:

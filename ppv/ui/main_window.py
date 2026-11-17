@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
 
 from ppv import __app_name__, __version__
 from ppv.core_manager import VpnCoreManager, find_singbox_binary
+from ppv.firewall_manager import FirewallSyncResult, sync_windows_firewall
+from ppv.models import AppSettings
 from ppv.process_helper import (
     cleanup_stale_ppv_instances,
     find_conflicting_vpns,
@@ -65,6 +67,18 @@ class _DownloadSingboxWorker(QThread):
             self.failed.emit(f"Không thể tải sing-box.exe: {exc}")
 
 
+class _FirewallSyncWorker(QThread):
+    finished_sync = Signal(object)
+
+    def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+
+    def run(self) -> None:
+        res = sync_windows_firewall(self.settings)
+        self.finished_sync.emit(res)
+
+
 class MainWindow(QMainWindow):
     """Main window hosting sidebar navigation, pages, core manager, and system tray."""
 
@@ -75,9 +89,9 @@ class MainWindow(QMainWindow):
         single_instance: SingleInstanceController | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle(f"{__app_name__} v{__version__} — Per-App WireGuard VPN")
-        self.resize(980, 660)
-        self.setMinimumSize(860, 580)
+        self.setWindowTitle(f"{__app_name__} v{__version__} — Per-App WireGuard VPN & Simple Firewall")
+        self.resize(1080, 700)
+        self.setMinimumSize(900, 600)
 
         self.storage = AppStorage()
         self.settings = self.storage.load_settings()
@@ -95,6 +109,7 @@ class MainWindow(QMainWindow):
         self._downloading_singbox = False
         self._connect_after_download = False
         self._download_worker: _DownloadSingboxWorker | None = None
+        self._fw_worker: _FirewallSyncWorker | None = None
 
         self._icon_idle = create_app_icon(state="disconnected")
         self._icon_connecting = create_app_icon(state="connecting")
@@ -128,7 +143,7 @@ class MainWindow(QMainWindow):
         self.nav_buttons: list[QPushButton] = []
         nav_items = [
             "Bảng điều khiển",
-            "Ứng dụng (VPN)",
+            "Tường lửa && Ứng dụng",
             "Profiles (.conf / WARP)",
             "Giám sát && Nhật ký",
             "Cài đặt",
@@ -187,6 +202,12 @@ class MainWindow(QMainWindow):
         if find_singbox_binary() is None:
             self._download_startup_timer.start(150)
 
+        self._fw_startup_timer = QTimer(self)
+        self._fw_startup_timer.setSingleShot(True)
+        self._fw_startup_timer.timeout.connect(lambda: self._sync_firewall(prompt_uac=False))
+        if self.settings.firewall_enabled and is_admin():
+            self._fw_startup_timer.start(200)
+
         if auto_connect or (self.settings.auto_connect_on_start and is_admin()):
             QTimer.singleShot(250, self._start_connection)
 
@@ -200,6 +221,8 @@ class MainWindow(QMainWindow):
 
         self.apps_page.rules_changed.connect(self._on_apps_changed)
         self.apps_page.apply_requested.connect(self._restart_if_running)
+        self.apps_page.firewall_sync_requested.connect(lambda: self._sync_firewall(prompt_uac=True))
+        self.apps_page.elevate_requested.connect(self._elevate_app)
 
         self.profiles_page.profiles_changed.connect(self._on_profiles_changed)
         self.profiles_page.active_profile_changed.connect(self._on_profile_selected)
@@ -210,6 +233,8 @@ class MainWindow(QMainWindow):
         self.core.log_received.connect(self.monitor_page.append_log)
         self.core.stats_updated.connect(self._on_stats_updated)
         self.core.error_occurred.connect(self._on_core_error)
+        self.core.tunnel_warning.connect(self._on_tunnel_warning)
+        self.monitor_page.logs_cleared.connect(self.core.clear_blocked_history)
 
     def _setup_tray(self) -> None:
         self.tray = QSystemTrayIcon(self._icon_idle, self)
@@ -220,11 +245,15 @@ class MainWindow(QMainWindow):
         self.tray_show_act.triggered.connect(self._restore_from_tray)
         self.tray_toggle_act = QAction("Kết nối VPN", self)
         self.tray_toggle_act.triggered.connect(self._toggle_connection)
+        self.tray_fw_off_act = QAction("Tắt nhanh Firewall (Mở lại mạng)", self)
+        self.tray_fw_off_act.triggered.connect(self._emergency_disable_firewall)
+        self.tray_fw_off_act.setEnabled(self.settings.firewall_enabled)
         self.tray_quit_act = QAction("Thoát hoàn toàn", self)
         self.tray_quit_act.triggered.connect(self.quit_completely)
 
         menu.addAction(self.tray_show_act)
         menu.addAction(self.tray_toggle_act)
+        menu.addAction(self.tray_fw_off_act)
         menu.addSeparator()
         menu.addAction(self.tray_quit_act)
 
@@ -487,6 +516,65 @@ class MainWindow(QMainWindow):
     def _on_apps_changed(self) -> None:
         self.storage.save_settings(self.settings)
         self.dashboard_page.refresh_data()
+        self.tray_fw_off_act.setEnabled(self.settings.firewall_enabled)
+
+    def _sync_firewall(self, prompt_uac: bool = True) -> None:
+        if self.settings.firewall_enabled and not is_admin():
+            if prompt_uac:
+                box = QMessageBox(self)
+                box.setWindowTitle("Cần quyền Administrator")
+                box.setText(
+                    "Windows cần quyền Administrator để áp dụng bộ lọc Windows Firewall (Simple Firewall)."
+                )
+                elev_btn = box.addButton("Cấp quyền Admin ngay", QMessageBox.ButtonRole.AcceptRole)
+                box.addButton("Để sau", QMessageBox.ButtonRole.RejectRole)
+                box.exec()
+                if box.clickedButton() == elev_btn:
+                    self._elevate_app()
+                else:
+                    self.settings.firewall_enabled = False
+                    self.storage.save_settings(self.settings)
+                    self.apps_page.refresh_view()
+                    self.dashboard_page.refresh_data()
+            return
+
+        if not self.settings.firewall_enabled and not is_admin():
+            self.tray_fw_off_act.setEnabled(False)
+            self.dashboard_page.refresh_data()
+            return
+
+        if self._fw_worker is not None and self._fw_worker.isRunning():
+            self._fw_worker.wait(1500)
+        self._fw_worker = _FirewallSyncWorker(self.settings, self)
+        self._fw_worker.finished_sync.connect(self._on_firewall_synced)
+        self._fw_worker.start()
+
+    def _on_firewall_synced(self, result: FirewallSyncResult) -> None:
+        self.storage.save_settings(self.settings)
+        self.tray_fw_off_act.setEnabled(result.enabled)
+        self.apps_page._sync_firewall_controls()
+        self.dashboard_page.refresh_data()
+
+        if result.enabled:
+            self.monitor_page.append_log(
+                f"[PPV Firewall] Đã bật ({result.mode}): {result.applied_block} app bị chặn, "
+                f"{result.applied_allow} rule cho phép."
+            )
+        else:
+            self.monitor_page.append_log(
+                f"[PPV Firewall] Đã tắt bộ lọc & khôi phục cấu hình gốc ({result.removed} rule đã gỡ)."
+            )
+        for err in result.errors:
+            self.monitor_page.append_log(f"[PPV Firewall] Cảnh báo: {err}")
+        if result.errors and result.enabled:
+            QMessageBox.warning(self, "Lỗi Windows Firewall", "\n".join(result.errors[:5]))
+
+    def _emergency_disable_firewall(self) -> None:
+        self.settings.firewall_enabled = False
+        self.storage.save_settings(self.settings)
+        self.apps_page.refresh_view()
+        self.dashboard_page.refresh_data()
+        self._sync_firewall(prompt_uac=True)
 
     def _on_profiles_changed(self) -> None:
         self.storage.save_profiles(self.profiles)
@@ -500,6 +588,8 @@ class MainWindow(QMainWindow):
         self.dashboard_page.refresh_conflicts()
 
     def _on_core_state_changed(self, state: str) -> None:
+        if state != "connected":
+            self.dashboard_page.set_tunnel_warning("")
         self.dashboard_page.set_connection_state(state)
         self.apps_page.set_connection_state(state)
 
@@ -541,6 +631,21 @@ class MainWindow(QMainWindow):
             self._restore_from_tray()
         QMessageBox.warning(self, "Lỗi VPN", msg)
 
+    def _on_tunnel_warning(self, message: str) -> None:
+        self.dashboard_page.set_tunnel_warning(message)
+        if message:
+            self.monitor_page.append_log(f"[PPV CẢNH BÁO] {message}")
+            if self.core.state == "connected":
+                self.setWindowIcon(self._icon_connecting)
+                self.tray.setIcon(self._icon_connecting)
+                self.tray.setToolTip(f"{__app_name__} — Tunnel chưa bắt tay được")
+        elif self.core.state == "connected":
+            prof = self._active_profile()
+            prof_name = prof.name if prof else "No Profile"
+            self.setWindowIcon(self._icon_active)
+            self.tray.setIcon(self._icon_active)
+            self.tray.setToolTip(f"{__app_name__} — Đã kết nối ({prof_name})")
+
     def closeEvent(self, event: QCloseEvent) -> None:
         if (
             not self._force_quit
@@ -563,11 +668,17 @@ class MainWindow(QMainWindow):
         self._connect_after_download = False
         self._conflict_timer.stop()
         self._download_startup_timer.stop()
+        self._fw_startup_timer.stop()
         self.core.stop_sync()
+        self.dashboard_page.stop_workers()
+        self.profiles_page.stop_workers()
+        self.apps_page.stop_workers()
         if self._stop_vpns_worker is not None and self._stop_vpns_worker.isRunning():
             self._stop_vpns_worker.wait(1500)
         if self._download_worker is not None and self._download_worker.isRunning():
             self._download_worker.wait(1500)
+        if self._fw_worker is not None and self._fw_worker.isRunning():
+            self._fw_worker.wait(1500)
         if self._single_instance is not None:
             self._single_instance.close()
         self.tray.hide()
@@ -579,11 +690,17 @@ class MainWindow(QMainWindow):
         self._connect_after_download = False
         self._conflict_timer.stop()
         self._download_startup_timer.stop()
+        self._fw_startup_timer.stop()
         self.core.stop_sync()
+        self.dashboard_page.stop_workers()
+        self.profiles_page.stop_workers()
+        self.apps_page.stop_workers()
         if self._stop_vpns_worker is not None and self._stop_vpns_worker.isRunning():
             self._stop_vpns_worker.wait(1500)
         if self._download_worker is not None and self._download_worker.isRunning():
             self._download_worker.wait(1500)
+        if self._fw_worker is not None and self._fw_worker.isRunning():
+            self._fw_worker.wait(1500)
         if self._single_instance is not None:
             self._single_instance.close()
         self.tray.hide()
