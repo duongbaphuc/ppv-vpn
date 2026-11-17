@@ -83,6 +83,14 @@ def _is_noisy_debug_log(line: str) -> bool:
     return "endpoint/wireguard[" in low and "routine:" in low
 
 
+def _is_wintun_adapter_collision(detail: str) -> bool:
+    """Return True when Wintun fails due to a transient/stale Windows TUN adapter collision."""
+    low = detail.lower()
+    return "cannot create a file when that file already exists" in low or (
+        "configure tun interface" in low and "element not found" in low
+    )
+
+
 def strip_ansi(text: str) -> str:
     """Remove ANSI color/control escape sequences from log text."""
     return _ANSI_ESCAPE_RE.sub("", text)
@@ -172,6 +180,10 @@ class VpnCoreManager(QObject):
         self._endpoint_lookup_times: deque[float] = deque(maxlen=10)
         self._wg_first_outbound_ts = 0.0
         self._last_tunnel_warning = ""
+        self._active_binary: Path | None = None
+        self._active_profile: WireGuardProfile | None = None
+        self._active_settings: AppSettings | None = None
+        self._tun_retry_used = False
 
         atexit.register(self.stop_sync)
 
@@ -219,6 +231,64 @@ class VpnCoreManager(QObject):
             return False, msg
         return True, "OK"
 
+    def _spawn_singbox_process(
+        self,
+        binary: Path,
+        profile: WireGuardProfile,
+        settings: AppSettings,
+        interface_name: str = "PPV-Tunnel",
+        append_log: bool = False,
+    ) -> bool:
+        self._api_port = _pick_free_port(19090)
+        self._api_secret = secrets.token_hex(12)
+        config_dict = build_singbox_config(
+            profile=profile,
+            settings=settings,
+            api_port=self._api_port,
+            api_secret=self._api_secret,
+            interface_name=interface_name,
+        )
+
+        ok, check_msg = self.validate_config(config_dict)
+        if not ok:
+            self.log_received.emit(f"[LỖI CẤU HÌNH] {check_msg}")
+            self.error_occurred.emit(check_msg)
+            self._set_state("error")
+            return False
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        try:
+            proc = subprocess.Popen(
+                [str(binary), "--disable-color", "run", "-c", str(self.config_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creation_flags,
+            )
+        except Exception as exc:
+            err = f"Không thể khởi chạy sing-box: {exc}"
+            self.log_received.emit(f"[LỖI] {err}")
+            self.error_occurred.emit(err)
+            self._set_state("error")
+            return False
+
+        with self._lock:
+            self._proc = proc
+
+        self.log_received.emit(
+            f"[PPV] Đang khởi động tunnel ({profile.name} -> {profile.endpoint}, iface={interface_name})..."
+        )
+        threading.Thread(
+            target=self._read_logs_loop, args=(proc, append_log), daemon=True
+        ).start()
+        threading.Thread(target=self._poll_api_loop, args=(proc,), daemon=True).start()
+        return True
+
     def start(self, profile: WireGuardProfile, settings: AppSettings) -> None:
         """Start the sing-box tunnel in background threads."""
         if self.is_running:
@@ -231,27 +301,15 @@ class VpnCoreManager(QObject):
             self._set_state("error")
             return
 
-        self._api_port = _pick_free_port(19090)
-        self._api_secret = secrets.token_hex(12)
-        config_dict = build_singbox_config(
-            profile=profile,
-            settings=settings,
-            api_port=self._api_port,
-            api_secret=self._api_secret,
-        )
-
-        ok, check_msg = self.validate_config(config_dict)
-        if not ok:
-            self.log_received.emit(f"[LỖI CẤU HÌNH] {check_msg}")
-            self.error_occurred.emit(check_msg)
-            self._set_state("error")
-            return
-
         self._stop_event.clear()
         self._recent_logs.clear()
         with self._lock:
             self._pending_log_conns.clear()
             self._blocked_events.clear()
+            self._active_binary = binary
+            self._active_profile = profile
+            self._active_settings = settings
+            self._tun_retry_used = False
             self._active_endpoint_host = (profile.endpoint_host or "").strip()
             self._active_endpoint_port = int(profile.endpoint_port or 2408)
             self._handshake_ok = False
@@ -279,42 +337,16 @@ class VpnCoreManager(QObject):
             self.log_received.emit(
                 f"[PPV] Đã dọn {cleaned} tiến trình sing-box cũ còn sót lại."
             )
+            self._stop_event.wait(0.8)
 
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-        try:
-            proc = subprocess.Popen(
-                [str(binary), "--disable-color", "run", "-c", str(self.config_path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creation_flags,
-            )
-        except Exception as exc:
-            err = f"Không thể khởi chạy sing-box: {exc}"
-            self.log_received.emit(f"[LỖI] {err}")
-            self.error_occurred.emit(err)
-            self._set_state("error")
-            return
+        self._spawn_singbox_process(binary, profile, settings, interface_name="PPV-Tunnel")
 
-        with self._lock:
-            self._proc = proc
-
-        self.log_received.emit(
-            f"[PPV] Đang khởi động tunnel ({profile.name} -> {profile.endpoint})..."
-        )
-        threading.Thread(target=self._read_logs_loop, args=(proc,), daemon=True).start()
-        threading.Thread(target=self._poll_api_loop, args=(proc,), daemon=True).start()
-
-    def _read_logs_loop(self, proc: subprocess.Popen[str]) -> None:
+    def _read_logs_loop(self, proc: subprocess.Popen[str], append_log: bool = False) -> None:
         assert proc.stdout is not None
         saw_started = False
+        log_mode = "a" if append_log else "w"
         try:
-            with self.log_path.open("w", encoding="utf-8") as log_file:
+            with self.log_path.open(log_mode, encoding="utf-8") as log_file:
                 for raw_line in proc.stdout:
                     line = strip_ansi(raw_line.rstrip("\r\n"))
                     if not line:
@@ -348,6 +380,34 @@ class VpnCoreManager(QObject):
         if rc != 0:
             self.log_received.emit(f"[PPV] sing-box thoát bất ngờ (mã {rc}).")
             detail = self._extract_error_detail()
+            if (
+                not saw_started
+                and not self._tun_retry_used
+                and _is_wintun_adapter_collision(detail)
+                and self._active_binary is not None
+                and self._active_profile is not None
+                and self._active_settings is not None
+            ):
+                self._tun_retry_used = True
+                self.log_received.emit(
+                    "[PPV] Adapter TUN 'PPV-Tunnel' đang kẹt trong Windows; "
+                    "đang tự thử lại với tên adapter dự phòng..."
+                )
+                if self._stop_event.wait(1.2):
+                    self._set_state("disconnected")
+                    self.stats_updated.emit(0, 0, 0, 0, [])
+                    return
+                self._recent_logs.clear()
+                fallback_iface = f"PPV-TUN-{secrets.token_hex(2).upper()}"
+                self._spawn_singbox_process(
+                    self._active_binary,
+                    self._active_profile,
+                    self._active_settings,
+                    interface_name=fallback_iface,
+                    append_log=True,
+                )
+                return
+
             msg = f"Tiến trình VPN dừng đột ngột (mã {rc})."
             if detail:
                 msg += f"\n\nChi tiết: {detail}"
@@ -654,9 +714,9 @@ def _detect_physical_interface_when_tun_active() -> str | None:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                "if (Get-NetAdapter -Name 'PPV-Tunnel' -ErrorAction SilentlyContinue) { "
+                "if (Get-NetAdapter -Name 'PPV-Tun*' -ErrorAction SilentlyContinue) { "
                 "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue "
-                "| Where-Object { $_.InterfaceAlias -notmatch 'PPV-Tunnel|Loopback' -and $_.NextHop -ne '0.0.0.0' } "
+                "| Where-Object { $_.InterfaceAlias -notmatch 'PPV-Tun|Loopback' -and $_.NextHop -ne '0.0.0.0' } "
                 "| Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).InterfaceAlias }",
             ],
             capture_output=True,

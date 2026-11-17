@@ -112,3 +112,58 @@ def test_dashboard_tunnel_warn_banner_visibility() -> None:
     app.processEvents()
     assert not page.tunnel_warn_banner.isVisible()
     page.close()
+
+
+def test_wintun_collision_triggers_automatic_fallback_interface_retry(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from ppv.core_manager import _is_wintun_adapter_collision
+
+    assert _is_wintun_adapter_collision(
+        "FATAL[0015] start service: configure tun interface: "
+        "(create adapter: Cannot create a file when that file already exists. | open existing adapter: Element not found.)"
+    )
+    assert not _is_wintun_adapter_collision("FATAL[0001] invalid wireguard key")
+
+    _ensure_app()
+    mgr = VpnCoreManager(tmp_path / "rt_retry")
+    mgr._active_binary = tmp_path / "sing-box.exe"
+    mgr._active_profile = WireGuardProfile(
+        name="WARP",
+        private_key="A" * 43 + "=",
+        addresses=["172.16.0.2/32"],
+        public_key="B" * 43 + "=",
+        endpoint_host="engage.cloudflareclient.com",
+        endpoint_port=2408,
+    )
+    mgr._active_settings = AppSettings()
+
+    errors: list[str] = []
+    mgr.error_occurred.connect(errors.append)
+
+    spawned_ifaces: list[str] = []
+
+    def fake_spawn(binary, profile, settings, interface_name="PPV-Tunnel", append_log=False):
+        _ = (binary, profile, settings, append_log)
+        spawned_ifaces.append(interface_name)
+        return True
+
+    monkeypatch.setattr(mgr, "_spawn_singbox_process", fake_spawn)
+    # Avoid waiting 1.2s in unit test
+    monkeypatch.setattr(mgr._stop_event, "wait", lambda _sec: False)
+
+    class _FakeProc:
+        stdout = [
+            "FATAL[0015] start service: start inbound/tun[tun-in]: configure tun interface: "
+            "(create adapter: Cannot create a file when that file already exists. | open existing adapter: Element not found.)\n"
+        ]
+
+        def wait(self) -> int:
+            return 1
+
+    mgr._read_logs_loop(_FakeProc())  # type: ignore[arg-type]
+
+    assert not errors
+    assert len(spawned_ifaces) == 1
+    assert spawned_ifaces[0].startswith("PPV-TUN-")
+    assert mgr._tun_retry_used is True

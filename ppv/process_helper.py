@@ -349,7 +349,7 @@ def terminate_process_by_pid(pid: int, wait_ms: int = 3000) -> tuple[bool, str]:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
-def stop_conflicting_vpns() -> tuple[list[str], list[str]]:
+def stop_conflicting_vpns(settle_sec: float = 1.0) -> tuple[list[str], list[str]]:
     """Stop all detected conflicting VPN services and processes.
 
     Returns `(stopped_labels, error_messages)`.
@@ -357,6 +357,7 @@ def stop_conflicting_vpns() -> tuple[list[str], list[str]]:
     conflicts = find_conflicting_vpns()
     stopped: list[str] = []
     errors: list[str] = []
+    stopped_services = False
 
     # 1. Stop services first (tunnels before manager) so adapters/routes tear down cleanly
     for item in conflicts:
@@ -365,6 +366,7 @@ def stop_conflicting_vpns() -> tuple[list[str], list[str]]:
         ok, msg = stop_windows_service(item.identifier)
         if ok:
             stopped.append(f"{item.display_name} ({item.identifier})")
+            stopped_services = True
         else:
             errors.append(msg)
 
@@ -382,6 +384,10 @@ def stop_conflicting_vpns() -> tuple[list[str], list[str]]:
                 stopped.append(f"{item.display_name} ({item.identifier})")
             else:
                 errors.append(f"{item.identifier}: {msg}")
+
+    if stopped_services and settle_sec > 0:
+        # Give Windows PnP / Wintun a moment to finish tearing down the old TUN device
+        time.sleep(settle_sec)
 
     return stopped, errors
 
