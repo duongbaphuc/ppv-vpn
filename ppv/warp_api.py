@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime
+import ipaddress
 import random
+import socket
 import ssl
 import string
+from typing import Any
 
 import requests
 from cryptography.hazmat.primitives import serialization
@@ -15,21 +18,31 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from requests.adapters import HTTPAdapter
 
 from ppv.models import WireGuardProfile
+from ppv.process_helper import _iter_process_entries
 
 
 class _WinCertHTTPAdapter(HTTPAdapter):
-    """HTTPAdapter verifying HTTPS against Windows Certificate Store (enterprise Root CAs)."""
+    """HTTPAdapter with optional Windows Certificate Store trust and explicit TLS SNI hostname."""
 
-    def __init__(self, ssl_context: ssl.SSLContext) -> None:
+    def __init__(
+        self,
+        ssl_context: ssl.SSLContext | None = None,
+        sni_hostname: str | None = None,
+    ) -> None:
         self._ssl_context = ssl_context
+        self._sni_hostname = sni_hostname
         super().__init__()
 
     def init_poolmanager(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        kwargs["ssl_context"] = self._ssl_context
+        if self._ssl_context is not None:
+            kwargs["ssl_context"] = self._ssl_context
+        if self._sni_hostname:
+            kwargs["server_hostname"] = self._sni_hostname
+            kwargs["assert_hostname"] = self._sni_hostname
         return super().init_poolmanager(*args, **kwargs)
 
 
-def _build_windows_trust_session() -> requests.Session:
+def _build_windows_ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     # Many enterprise Windows Root CAs omit the critical flag on Basic Constraints,
     # which Python 3.13 / OpenSSL 3.x VERIFY_X509_STRICT rejects by default.
@@ -45,11 +58,35 @@ def _build_windows_trust_session() -> requests.Session:
                 if enc == "x509_asn":
                     with contextlib.suppress(Exception):
                         ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(cert_bytes))
+    return ctx
+
+
+def _build_windows_trust_session() -> requests.Session:
     session = requests.Session()
-    session.mount("https://", _WinCertHTTPAdapter(ctx))
+    session.mount("https://", _WinCertHTTPAdapter(_build_windows_ssl_context()))
     return session
 
-WARP_REG_URL = "https://api.cloudflareclient.com/v0a2158/reg"
+
+def _build_sni_session(sni_hostname: str, use_windows_store: bool = False) -> requests.Session:
+    ctx = _build_windows_ssl_context() if use_windows_store else None
+    session = requests.Session()
+    session.mount("https://", _WinCertHTTPAdapter(ssl_context=ctx, sni_hostname=sni_hostname))
+    return session
+
+
+WARP_API_HOST = "api.cloudflareclient.com"
+WARP_API_PATH = "/v0a2158/reg"
+WARP_REG_URL = f"https://{WARP_API_HOST}{WARP_API_PATH}"
+WARP_DOH_ENDPOINTS: tuple[str, ...] = (
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+    "https://8.8.8.8/resolve",
+)
+WARP_FALLBACK_IPS: tuple[str, ...] = (
+    "104.16.24.84",
+    "104.16.192.82",
+    "162.159.192.4",
+)
 WARP_HEADERS = {
     "User-Agent": "okhttp/3.12.1",
     "CF-Client-Version": "a-6.10-2158",
@@ -99,6 +136,126 @@ def _random_id(length: int) -> str:
     return "".join(random.choices(alphabet, k=length))
 
 
+def _is_dns_resolution_error(exc: BaseException) -> bool:
+    """Return True when exc (or its causal chain) indicates DNS hostname resolution failure."""
+    visited: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        cur = stack.pop()
+        if id(cur) in visited:
+            continue
+        visited.add(id(cur))
+        if isinstance(cur, socket.gaierror):
+            return True
+        msg = str(cur).lower()
+        if any(
+            marker in msg
+            for marker in (
+                "getaddrinfo failed",
+                "failed to resolve",
+                "nameresolutionerror",
+                "temporary failure in name resolution",
+                "[errno 11001]",
+                "[errno 11002]",
+            )
+        ):
+            return True
+        if cur.__cause__ is not None:
+            stack.append(cur.__cause__)
+        if cur.__context__ is not None:
+            stack.append(cur.__context__)
+        for arg in getattr(cur, "args", ()):
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+    return False
+
+
+def _resolve_warp_api_ips_via_doh(timeout: float = 5.0) -> list[str]:
+    """Resolve api.cloudflareclient.com via IP-based DoH, appending static edge IPs."""
+    ips: list[str] = []
+    seen: set[str] = set()
+
+    def _add_ip(raw_ip: str) -> None:
+        cleaned = raw_ip.strip()
+        if not cleaned or cleaned in seen:
+            return
+        with contextlib.suppress(ValueError):
+            ipaddress.IPv4Address(cleaned)
+            seen.add(cleaned)
+            ips.append(cleaned)
+
+    for doh_url in WARP_DOH_ENDPOINTS:
+        try:
+            try:
+                resp = requests.get(
+                    doh_url,
+                    params={"name": WARP_API_HOST, "type": "A"},
+                    headers={"Accept": "application/dns-json"},
+                    timeout=timeout,
+                )
+            except requests.exceptions.SSLError:
+                resp = _build_windows_trust_session().get(
+                    doh_url,
+                    params={"name": WARP_API_HOST, "type": "A"},
+                    headers={"Accept": "application/dns-json"},
+                    timeout=timeout,
+                )
+            if resp.ok:
+                data = resp.json()
+                for ans in data.get("Answer", []):
+                    if isinstance(ans, dict) and ans.get("type") == 1:
+                        _add_ip(str(ans.get("data", "")))
+            if ips:
+                break
+        except Exception:
+            continue
+
+    for fallback_ip in WARP_FALLBACK_IPS:
+        _add_ip(fallback_ip)
+    return ips
+
+
+def _post_warp_direct_ip(
+    ip: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+) -> requests.Response:
+    direct_url = f"https://{ip}{WARP_API_PATH}"
+    direct_headers = {**headers, "Host": WARP_API_HOST}
+    try:
+        return _build_sni_session(WARP_API_HOST, use_windows_store=False).post(
+            direct_url, headers=direct_headers, json=payload, timeout=timeout
+        )
+    except requests.exceptions.SSLError:
+        return _build_sni_session(WARP_API_HOST, use_windows_store=True).post(
+            direct_url, headers=direct_headers, json=payload, timeout=timeout
+        )
+
+
+def _format_warp_connection_error(
+    exc: requests.RequestException,
+    had_dns_failure: bool = False,
+) -> str:
+    simplewall_on = any(
+        name.lower() == "simplewall.exe" for _pid, name in _iter_process_entries()
+    )
+    if had_dns_failure or _is_dns_resolution_error(exc) or simplewall_on:
+        hints: list[str] = []
+        if simplewall_on:
+            hints.append(
+                "Phát hiện simplewall.exe đang chạy — hãy kiểm tra và cho phép PPV-VPN.exe kết nối mạng trong simplewall"
+            )
+        hints.append(
+            "hoặc kiểm tra kết nối DNS/mạng (cũng có thể dùng '+ Nhập file .conf' nếu đã có file WireGuard)"
+        )
+        return (
+            f"Không thể kết nối tới máy chủ Cloudflare WARP: {exc}\n\n"
+            f"Gợi ý: {'; '.join(hints)}."
+        )
+    return f"Không thể kết nối tới máy chủ Cloudflare WARP: {exc}"
+
+
 def register_warp_profile(
     name: str = "Cloudflare WARP",
     timeout: float = 15.0,
@@ -119,6 +276,7 @@ def register_warp_profile(
         "locale": "en_US",
     }
 
+    resp: requests.Response | None = None
     try:
         try:
             resp = requests.post(WARP_REG_URL, headers=WARP_HEADERS, json=payload, timeout=timeout)
@@ -128,7 +286,26 @@ def register_warp_profile(
                 WARP_REG_URL, headers=WARP_HEADERS, json=payload, timeout=timeout
             )
     except requests.RequestException as exc:
-        raise WarpRegistrationError(f"Không thể kết nối tới máy chủ Cloudflare WARP: {exc}") from exc
+        if not _is_dns_resolution_error(exc):
+            raise WarpRegistrationError(_format_warp_connection_error(exc)) from exc
+
+        last_exc: requests.RequestException = exc
+        for candidate_ip in _resolve_warp_api_ips_via_doh(timeout=min(timeout, 5.0)):
+            try:
+                resp = _post_warp_direct_ip(
+                    candidate_ip,
+                    WARP_HEADERS,
+                    payload,
+                    timeout=min(timeout, 8.0),
+                )
+                break
+            except requests.RequestException as ip_exc:
+                last_exc = ip_exc
+                continue
+        if resp is None:
+            raise WarpRegistrationError(
+                _format_warp_connection_error(last_exc, had_dns_failure=True)
+            ) from last_exc
 
     if not resp.ok:
         raise WarpRegistrationError(
