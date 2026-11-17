@@ -1,0 +1,14 @@
+# Mẫu cấu hình WireGuard / Cloudflare WARP+
+# Đổi tên thành warpplus.conf và điền khóa của bạn (hoặc dùng nút "Tạo Cloudflare WARP miễn phí" ngay trong app).
+
+[Interface]
+PrivateKey = <YOUR_WIREGUARD_PRIVATE_KEY>
+Address = 172.16.0.2/24
+Address = fd01:5ca1:ab1e::2/120
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = <PEER_PUBLIC_KEY>
+Endpoint = engage.cloudflareclient.com:2408
+AllowedIPs = 0.0.0.0/0
+AllowedIPs = ::/0
