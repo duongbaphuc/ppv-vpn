@@ -1,6 +1,6 @@
 [project]
 name = "ppv-vpn"
-version = "1.1.4"
+version = "1.1.5"
 description = "Per-App Split-Tunneling WireGuard & WARP+ VPN for Windows"
 requires-python = ">=3.11"
 dependencies = [

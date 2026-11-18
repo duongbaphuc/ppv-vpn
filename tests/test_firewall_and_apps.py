@@ -448,3 +448,60 @@ def test_sync_windows_firewall_uses_com_propertyput_on_cdispatch() -> None:
     res_off = firewall_manager.disable_windows_firewall(settings, policy=policy)
     assert not res_off.errors
     assert all(policy.DefaultOutboundAction(b) == firewall_manager.NET_FW_ACTION_ALLOW for b in (1, 2, 4))
+
+
+def test_firewall_rules_never_contain_pipe_and_rollback_on_essentials_failure() -> None:
+    class _StrictRulesCollection(_FakeRulesCollection):
+        def Add(self, rule: Any) -> None:
+            for attr in ("Name", "Grouping", "Description"):
+                val = str(getattr(rule, attr, "") or "")
+                if "|" in val:
+                    raise ValueError(f"E_INVALIDARG (0x80070057): illegal pipe in {attr}: {val}")
+            super().Add(rule)
+
+    policy = _FakeCDispatchFwPolicy2()
+    policy.Rules = _StrictRulesCollection()
+    settings = AppSettings(
+        firewall_enabled=True,
+        firewall_mode="allowlist",
+        app_rules=[
+            AppRule("Weird|App", "app|1.exe", r"C:\Apps\app1.exe", enabled=True, action="vpn"),
+            AppRule("BlockedTool", "curl.exe", r"C:\Apps\curl.exe", enabled=True, action="block"),
+        ],
+    )
+    running = [
+        DiscoveredApp("Edge", "msedge.exe", r"C:\Apps\msedge.exe", "running", True, 300),
+    ]
+    res = firewall_manager.sync_windows_firewall(
+        settings,
+        running_apps=running,
+        policy=policy,
+        rule_factory=_FakeFwRule,
+    )
+    assert not res.errors
+    assert res.enabled is True
+    assert all("|" not in (r.Name or "") and "#" not in (r.Name or "") for r in policy.Rules)
+
+    # Simulate failure adding essential rules -> DefaultOutboundAction must NOT be left as BLOCK
+    class _FailingRulesCollection(_FakeRulesCollection):
+        def Add(self, rule: Any) -> None:
+            raise OSError(-2147024809, "The parameter is incorrect.")
+
+    rollback_policy = _FakeCDispatchFwPolicy2()
+    rollback_policy._outbound = {1: 1, 2: 1, 4: 1}
+    rollback_policy.Rules = _FailingRulesCollection()
+    rollback_settings = AppSettings(firewall_enabled=True, firewall_mode="allowlist")
+
+    res_fail = firewall_manager.sync_windows_firewall(
+        rollback_settings,
+        running_apps=[],
+        policy=rollback_policy,
+        rule_factory=_FakeFwRule,
+    )
+    assert not res_fail.enabled
+    assert rollback_settings.firewall_enabled is False
+    assert res_fail.errors
+    assert all(
+        rollback_policy.DefaultOutboundAction(b) == firewall_manager.NET_FW_ACTION_ALLOW
+        for b in (1, 2, 4)
+    )

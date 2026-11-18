@@ -186,6 +186,11 @@ def _resolve_rule_paths(
     return paths
 
 
+def _sanitize_rule_name(name: str) -> str:
+    # Windows Firewall API (FWAddFirewallRule) rejects '|' because it is the registry serializer delimiter.
+    return name.replace("|", "-").strip() or "PPV-FW Rule"
+
+
 def _add_app_rule(
     policy: Any,
     rule_factory: Callable[[], Any],
@@ -197,18 +202,18 @@ def _add_app_rule(
     remote_ports: str | None = None,
 ) -> None:
     fw_rule = rule_factory()
-    fw_rule.Name = name
-    fw_rule.Grouping = RULE_GROUP
+    fw_rule.Name = _sanitize_rule_name(name)
     fw_rule.Description = "Managed by PPV VPN Simple Firewall"
     if app_path:
         fw_rule.ApplicationName = app_path
     fw_rule.Action = action
     fw_rule.Direction = direction
-    fw_rule.Profiles = NET_FW_PROFILE2_ALL
     if protocol is not None:
         fw_rule.Protocol = protocol
         if remote_ports:
             fw_rule.RemotePorts = remote_ports
+    fw_rule.Profiles = NET_FW_PROFILE2_ALL
+    fw_rule.Grouping = RULE_GROUP
     fw_rule.Enabled = True
     policy.Rules.Add(fw_rule)
 
@@ -242,7 +247,7 @@ def _add_allowlist_essentials(
         _add_app_rule(
             policy,
             rule_factory,
-            name=f"{RULE_PREFIX}SYS ALLOW | {label}",
+            name=f"{RULE_PREFIX}SYS ALLOW - {label}",
             app_path=norm,
             action=NET_FW_ACTION_ALLOW,
             direction=NET_FW_RULE_DIR_OUT,
@@ -260,7 +265,7 @@ def _add_allowlist_essentials(
         _add_app_rule(
             policy,
             rule_factory,
-            name=f"{RULE_PREFIX}SYS CORE | {label}",
+            name=f"{RULE_PREFIX}SYS CORE - {label}",
             app_path=svchost_str,
             action=NET_FW_ACTION_ALLOW,
             direction=NET_FW_RULE_DIR_OUT,
@@ -309,14 +314,9 @@ def sync_windows_firewall(
         if settings.firewall_saved_profiles is None:
             settings.firewall_saved_profiles = _snapshot_profiles(fw_policy)
 
-        target_outbound = (
-            NET_FW_ACTION_BLOCK
-            if settings.firewall_mode == "allowlist"
-            else NET_FW_ACTION_ALLOW
-        )
+        # Enable profiles safely first, keeping DefaultOutboundAction open until allowlist rules succeed
         for bit in _PROFILE_BITS:
             _set_firewall_enabled(fw_policy, bit, True)
-            _set_default_outbound(fw_policy, bit, target_outbound)
 
         removed = _remove_ppv_rules(fw_policy)
 
@@ -335,9 +335,24 @@ def sync_windows_firewall(
 
         if settings.firewall_mode == "allowlist":
             try:
-                applied_allow += _add_allowlist_essentials(fw_policy, mk_rule, seen_allow_paths)
+                essentials_added = _add_allowlist_essentials(fw_policy, mk_rule, seen_allow_paths)
+                applied_allow += essentials_added
             except Exception as exc:
+                essentials_added = 0
                 errors.append(f"Không thể thêm rule hệ thống thiết yếu: {exc}")
+            if essentials_added == 0:
+                _remove_ppv_rules(fw_policy)
+                if settings.firewall_saved_profiles is not None:
+                    _restore_profiles(fw_policy, settings.firewall_saved_profiles)
+                    settings.firewall_saved_profiles = None
+                settings.firewall_enabled = False
+                return FirewallSyncResult(
+                    enabled=False,
+                    mode=settings.firewall_mode,
+                    removed=removed,
+                    errors=errors
+                    or ["Không thể tạo rule hệ thống thiết yếu cho Allowlist; đã tự hủy bật Firewall để tránh mất mạng."],
+                )
 
         for idx, rule in enumerate(settings.app_rules):
             if not rule.enabled:
@@ -357,7 +372,7 @@ def sync_windows_firewall(
                         _add_app_rule(
                             fw_policy,
                             mk_rule,
-                            name=f"{RULE_PREFIX}BLOCK OUT | {rule.exe_name} #{idx}_{p_idx}",
+                            name=f"{RULE_PREFIX}BLOCK OUT - {rule.exe_name} ({idx}-{p_idx})",
                             app_path=path_str,
                             action=NET_FW_ACTION_BLOCK,
                             direction=NET_FW_RULE_DIR_OUT,
@@ -365,7 +380,7 @@ def sync_windows_firewall(
                         _add_app_rule(
                             fw_policy,
                             mk_rule,
-                            name=f"{RULE_PREFIX}BLOCK IN | {rule.exe_name} #{idx}_{p_idx}",
+                            name=f"{RULE_PREFIX}BLOCK IN - {rule.exe_name} ({idx}-{p_idx})",
                             app_path=path_str,
                             action=NET_FW_ACTION_BLOCK,
                             direction=NET_FW_RULE_DIR_IN,
@@ -381,7 +396,7 @@ def sync_windows_firewall(
                         _add_app_rule(
                             fw_policy,
                             mk_rule,
-                            name=f"{RULE_PREFIX}ALLOW OUT | {rule.exe_name} #{idx}_{p_idx}",
+                            name=f"{RULE_PREFIX}ALLOW OUT - {rule.exe_name} ({idx}-{p_idx})",
                             app_path=path_str,
                             action=NET_FW_ACTION_ALLOW,
                             direction=NET_FW_RULE_DIR_OUT,
@@ -409,7 +424,7 @@ def sync_windows_firewall(
                     _add_app_rule(
                         fw_policy,
                         mk_rule,
-                        name=f"{RULE_PREFIX}BLOCK UNASSIGNED | {app.exe_name} #{u_idx}",
+                        name=f"{RULE_PREFIX}BLOCK UNASSIGNED - {app.exe_name} ({u_idx})",
                         app_path=norm_path,
                         action=NET_FW_ACTION_BLOCK,
                         direction=NET_FW_RULE_DIR_OUT,
@@ -417,6 +432,14 @@ def sync_windows_firewall(
                     applied_block += 1
                 except Exception as exc:
                     errors.append(f"Block unassigned {app.exe_name} ({norm_path}): {exc}")
+
+        target_outbound = (
+            NET_FW_ACTION_BLOCK
+            if settings.firewall_mode == "allowlist"
+            else NET_FW_ACTION_ALLOW
+        )
+        for bit in _PROFILE_BITS:
+            _set_default_outbound(fw_policy, bit, target_outbound)
 
         return FirewallSyncResult(
             enabled=True,

@@ -566,7 +566,7 @@ class MainWindow(QMainWindow):
             )
         for err in result.errors:
             self.monitor_page.append_log(f"[PPV Firewall] Cảnh báo: {err}")
-        if result.errors and result.enabled:
+        if result.errors:
             QMessageBox.warning(self, "Lỗi Windows Firewall", "\n".join(result.errors[:5]))
 
     def _emergency_disable_firewall(self) -> None:
